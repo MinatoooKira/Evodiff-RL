@@ -5,6 +5,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 import math
 from torch.nn.utils.rnn import pad_sequence
+import json
+import pickle
 
 from evodiff.pretrained import OA_DM_38M
 from evodiff.generate import generate_oaardm
@@ -13,49 +15,61 @@ from evodiff.generate import generate_oaardm
 # 配置和超参数
 # ---------------------------
 CONFIG = {
-    "kl_beta": 0.1,  # KL散度惩罚的系数 (原beta参数)
+    "kl_beta": 0.1,
     "learning_rate": 1e-6,
     "rl_epochs": 30,
     "steps_per_epoch": 100,
-    "batch_size": 32, # 在GRPO中，每个batch被视为一个“group”
+    "batch_size": 32,
     "seq_len": 100,
     "adam_betas": (0.9, 0.98),
     "epsilon": 1e-8,
     "weight_decay": 0.01,
-    "epsilon_std": 1e-8, # 用于计算优势时防止除以零
+    "epsilon_std": 1e-8,
 }
 
-# 选择设备
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 定义碱性氨基酸
-BASIC_AAS = ['R', 'K', 'H']
+# ---------------------------
+# AlphaFold结构打分用的函数
+# ---------------------------
+def get_reward(sequences, target_sequence, af2_predict_fn, output_root):
+    rewards = []
+    os.makedirs(output_root, exist_ok=True)
+
+    for i, binder_seq in enumerate(sequences):
+        try:
+            fasta_path = os.path.join(output_root, f"seq_{i}.fasta")
+            with open(fasta_path, "w") as f:
+                f.write(">target\n" + target_sequence.strip() + "\n")
+                f.write(">binder\n" + binder_seq.strip() + "\n")
+
+            job_dir = os.path.join(output_root, f"job_{i}")
+            os.makedirs(job_dir, exist_ok=True)
+            af2_predict_fn(fasta_path, job_dir)
+
+            with open(os.path.join(job_dir, "ranking_debug.json")) as f:
+                rank_data = json.load(f)
+                model_name = rank_data["order"][0]
+                iptm = rank_data["ranking_confidences"][model_name]
+
+            with open(os.path.join(job_dir, f"result_{model_name}.pkl"), "rb") as f:
+                result = pickle.load(f)
+                avg_plddt = float(result["plddt"].mean())
+
+            reward = iptm + 0.1 * avg_plddt
+            rewards.append(reward)
+
+        except Exception as e:
+            print(f"[!] Error in sequence {i}: {e}")
+            rewards.append(-100.0)
+
+    return torch.tensor(rewards, dtype=torch.float, device=device)
+
 
 # ---------------------------
-# 核心功能函数
+# NLL + GRPO loss
 # ---------------------------
-
-def get_reward(sequences):
-    """
-    计算序列的奖励分数。
-    奖励定义为序列中碱性氨基酸（R, K, H）的百分比。
-    """
-    scores = []
-    for seq in sequences:
-        length = len(seq)
-        if length == 0:
-            scores.append(0.0)
-            continue
-        count = sum(seq.count(aa) for aa in BASIC_AAS)
-        percentage = (count / length) * 100
-        scores.append(percentage)
-    return torch.tensor(scores, dtype=torch.float, device=device)
-
 def calculate_nll(model, tokenizer, sequences, device):
-    """
-    计算给定序列的负对数似然 (Negative Log-Likelihood, NLL)。
-    此函数不管理模型的模式或梯度。
-    """
     loss_fn = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=tokenizer.pad_id)
 
     tokenized_list = [torch.tensor(tokenizer.tokenizeMSA(s)) for s in sequences]
@@ -72,29 +86,13 @@ def calculate_nll(model, tokenizer, sequences, device):
     return nll_per_sequence
 
 def grpo_loss(log_ratios, advantages, kl_beta):
-    """
-    计算 GRPO (Group Relative Policy Optimization) 的损失。
-    
-    Args:
-        log_ratios (torch.Tensor): 策略与参考模型的对数似然比 (policy_log_likelihood - ref_log_likelihood)。
-        advantages (torch.Tensor): 每个序列的归一化优势分数。
-        kl_beta (float): KL散度惩罚项的系数。
-
-    Returns:
-        torch.Tensor: 计算出的总损失。
-    """
-    # 策略目标：我们希望最大化 (advantages * log_ratios)，所以损失是其负值。
-    # 优势为正的样本会促使 log_ratios 增大，反之亦然。
     policy_objective = - (advantages * log_ratios).mean()
-    
-    # KL惩罚项：防止策略模型偏离参考模型太远。
-    # log_ratios 本身就是 KL 散度的一个估计。
     kl_penalty = kl_beta * log_ratios.mean()
-
     return policy_objective + kl_penalty
 
+
 # ---------------------------
-# 主训练循环
+# Main Training Loop
 # ---------------------------
 def main():
     print(f"Using device: {device}")
@@ -109,7 +107,6 @@ def main():
     assert policy_tokenizer.alphabet == ref_tokenizer.alphabet, "Tokenizers must be the same"
     tokenizer = policy_tokenizer
 
-    # 冻结参考模型的参数，它只用于计算基线，不参与训练
     for param in ref_model.parameters():
         param.requires_grad = False
     ref_model.eval()
@@ -123,6 +120,12 @@ def main():
         weight_decay=CONFIG["weight_decay"],
     )
 
+    target_sequence = "IIGGKEVSPHSRPFMASIQYGGHHVCGGVLIDPQWVLTAAHCQYRFTKGQSPTVVLGAHSLSKNEASKQTLEIKKFIPFSRVTSDPQSNDIMLVKLQTAAKLNKHVKMLHIRSKTSLRSGTKCKVTGWGATDPDSLRPSDTLREVTVTVLSRKLCNSQSYYNGDPFITKDMVCAGDAKGQKDSCKGDSGGPLICKGVFHAIVSGGHECGVATKPGIYTLLTKKYQTWIKSNLVPPHTNDYKDDDDK"  # GZMK-Flag 切后
+    output_root = "af2_multimer_outputs"
+
+    def af2_predict_fn(fasta_path, output_dir):
+        os.system(f"run_af2_multimer.sh {fasta_path} {output_dir}")  # 注意！！！！！！这部分需要051完成。需要创建一个run_af2_multimer.sh来运行af2multimer。
+
     print("Starting GRPO fine-tuning...")
     for epoch in range(CONFIG["rl_epochs"]):
         print(f"\n--- Epoch {epoch + 1}/{CONFIG['rl_epochs']} ---")
@@ -133,10 +136,9 @@ def main():
         pbar = tqdm(range(CONFIG["steps_per_epoch"]), desc=f"Epoch {epoch + 1} Loss: N/A, Avg Reward: N/A")
 
         for step in pbar:
-            # 1. 生成序列 (需要 policy_model 在 eval 模式下)
             policy_model.eval()
             with torch.no_grad():
-                 _, gen_seqs = generate_oaardm(
+                _, gen_seqs = generate_oaardm(
                     model=policy_model,
                     tokenizer=tokenizer,
                     seq_len=CONFIG["seq_len"],
@@ -144,50 +146,34 @@ def main():
                     device=device
                 )
             
-            # 2. 评估奖励
-            rewards = get_reward(gen_seqs)
+            rewards = get_reward(gen_seqs, target_sequence, af2_predict_fn, output_root)
             all_rewards.extend(rewards.cpu().numpy())
 
-            # --- GRPO核心改动 ---
-            # 3. 计算分组相对优势 (Group-Relative Advantage)
-            # 我们将每个batch视为一个“group”，计算每个样本相对于组内平均奖励的优势。
-            # advantages 是一个归一化的分数，表示每个奖励比平均水平好/差多少。
             with torch.no_grad():
                 advantages = (rewards - rewards.mean()) / (rewards.std() + CONFIG["epsilon_std"])
-            # --- 结束改动 ---
-            
-            # 4. 计算似然并进行优化 (需要 policy_model 在 train 模式下)
+
             policy_model.train()
-            
-            # 为 policy_model 计算 NLL，此时会构建计算图
             policy_nll = calculate_nll(policy_model, tokenizer, gen_seqs, device)
-            
-            # 使用 `no_grad` 上下文为 ref_model 计算 NLL，不构建计算图
+
             with torch.no_grad():
                 ref_nll = calculate_nll(ref_model, tokenizer, gen_seqs, device)
-            
+
             policy_log_likelihood = -policy_nll
             ref_log_likelihood = -ref_nll
-            
-            # 计算对数似然比
             log_ratios = policy_log_likelihood - ref_log_likelihood
 
-            # 5. 优化步骤
             optimizer.zero_grad()
-            # 使用 GRPO 损失函数
             loss = grpo_loss(log_ratios, advantages, CONFIG["kl_beta"])
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            
-            if len(all_rewards) > 0:
-                avg_reward = sum(all_rewards) / len(all_rewards)
-                pbar.set_description(f"Epoch {epoch + 1} Loss: {loss.item():.4f}, Avg Reward: {avg_reward:.2f}%")
+            avg_reward = sum(all_rewards) / len(all_rewards)
+            pbar.set_description(f"Epoch {epoch + 1} Loss: {loss.item():.4f}, Avg Reward: {avg_reward:.2f}")
 
         avg_epoch_loss = total_loss / CONFIG["steps_per_epoch"]
         avg_epoch_reward = sum(all_rewards) / len(all_rewards)
-        print(f"Epoch {epoch + 1} finished. Average Loss: {avg_epoch_loss:.4f}, Average Reward: {avg_epoch_reward:.2f}%")
+        print(f"Epoch {epoch + 1} finished. Average Loss: {avg_epoch_loss:.4f}, Average Reward: {avg_epoch_reward:.2f}")
 
         output_dir = f"evodiff_grpo_checkpoint_epoch_{epoch+1}"
         os.makedirs(output_dir, exist_ok=True)
